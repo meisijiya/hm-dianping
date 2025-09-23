@@ -12,8 +12,9 @@ import org.springframework.stereotype.Service;
 
 import javax.annotation.Resource;
 import java.security.Key;
+import java.util.concurrent.TimeUnit;
 
-import static com.hmdp.utils.RedisConstants.CACHE_SHOP_KEY;
+import static com.hmdp.utils.RedisConstants.*;
 
 /**
  * <p>
@@ -38,14 +39,37 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
             Shop shop= JSONUtil.toBean(shopJson, Shop.class);
             return Result.ok(shop);
         }
+        /*  内容：添加判断命中的是否空值
+            时间： 2025/9/24 00:18 */
+         if(shopJson!=null){
+             //返回一个错误信息
+             return Result.fail("店铺不存在");
+         }
         // 4.不存在，根据id查询数据库
         Shop shop = getById( id);
         // 5.数据库不存在，返回错误
         if(shop==null){
+            /*  内容：将空值写入Redis
+                时间： 2025/9/24 00:20 */
+             stringRedisTemplate.opsForValue().set(Key,"",CACHE_NULL_TTL,TimeUnit.MINUTES);
             return Result.fail("店铺不存在");
         }
         //6.存在，写入redis
-        stringRedisTemplate.opsForValue().set(Key,JSONUtil.toJsonStr(shop));
+        //设置redis缓存时添加过期时间
+        stringRedisTemplate.opsForValue().set(Key,JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL, TimeUnit.MINUTES);
         return Result.ok(shop);
+    }
+
+    @Override
+    public Result update(Shop shop) {
+        Long id=shop.getId();
+        if(id==null){
+            return Result.fail("店铺id不能为空");
+        }
+        //1.更新数据库
+        updateById(shop);
+        //2.删除缓存
+        stringRedisTemplate.delete(CACHE_SHOP_KEY+id);
+        return Result.ok();
     }
 }
