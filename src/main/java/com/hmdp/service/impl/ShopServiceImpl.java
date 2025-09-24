@@ -1,5 +1,6 @@
 package com.hmdp.service.impl;
 
+import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.hmdp.dto.Result;
@@ -13,6 +14,7 @@ import org.springframework.stereotype.Service;
 import javax.annotation.Resource;
 import java.security.Key;
 import java.util.concurrent.TimeUnit;
+import java.util.Random;
 
 import static com.hmdp.utils.RedisConstants.*;
 
@@ -26,38 +28,110 @@ import static com.hmdp.utils.RedisConstants.*;
  */
 @Service
 public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IShopService {
+    /*  内容：定义互斥锁的上锁和解锁方法
+        时间： 2025/9/24 10:53 */
+    private boolean tryLock(String key){
+        Boolean flag=stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
+        return BooleanUtil.isTrue(flag);
+    }
+    private void unLock(String key){
+        stringRedisTemplate.delete(key);
+    }
+
     @Resource
     private StringRedisTemplate stringRedisTemplate;
     @Override
     public Result queryById(Long id) {
+        //缓存穿透
+        //
+        queryWithMutex(id);
+    }
+/*  内容：利用互斥锁解决缓存击穿问题
+    时间： 2025/9/24 16:45 */
+    private Shop queryWithMutex(Long id) {
         String Key=CACHE_SHOP_KEY+id;
         // 1.从redis查询商铺缓存
         String shopJson=stringRedisTemplate.opsForValue().get(Key);
-        //2.判断是否存在
+        //2.判断缓存是否命中
+        //isNotBlank用于判断字符串是否‌不为空且不全是空白字符‌的方法
         if(StrUtil.isNotBlank(shopJson)){
             // 3.存在直接返回
-            Shop shop= JSONUtil.toBean(shopJson, Shop.class);
-            return Result.ok(shop);
+            return JSONUtil.toBean(shopJson, Shop.class);
         }
+        //判断命中的值是否是空值
+        if (shopJson != null) {
+            //是空值，则返回一个错误信息
+            return null;
+        }
+        //4.未命中则尝试获取互斥锁
+        String lockKey=LOCK_SHOP_KEY+id;
+        Shop shop = null;
+        try {
+            boolean isLock=tryLock(lockKey);
+            //判断是否成功获取
+            if(!isLock){
+                //失败，则休眠重试
+                Thread.sleep(50);
+                return queryWithMutex(id);
+            }
+            //5.成功，根据id查询数据库
+            shop=getById(id);
+            if(shop==null){
+                //不存在，将空值写入Redis
+                stringRedisTemplate.opsForValue().set(Key,"",CACHE_NULL_TTL,TimeUnit.MINUTES);
+                //返回错误信息
+                return null;
+            }
+        //6.写入Redis
+        //设置redis缓存时添加过期时间，增加随机值防止缓存雪崩
+        Random random = new Random();
+        long randomTTL = CACHE_SHOP_TTL + random.nextInt(10);
+        stringRedisTemplate.opsForValue().set(Key,JSONUtil.toJsonStr(shop),randomTTL, TimeUnit.MINUTES);
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        }finally {
+            //7.释放锁
+            unLock(lockKey);
+        }
+        //8.返回
+        return shop;
+    }
+
+    /*  内容：解决缓存穿透的封装
+        时间： 2025/9/24 10:54 */
+     public Shop queryWithPassThrough(Long id) {
+         String Key=CACHE_SHOP_KEY+id;
+         // 1.从redis查询商铺缓存
+         String shopJson=stringRedisTemplate.opsForValue().get(Key);
+         //2.判断是否存在
+         if(StrUtil.isNotBlank(shopJson)){
+             // 3.存在直接返回
+             return JSONUtil.toBean(shopJson, Shop.class);
+         }
         /*  内容：添加判断命中的是否空值
             时间： 2025/9/24 00:18 */
          if(shopJson!=null){
              //返回一个错误信息
-             return Result.fail("店铺不存在");
+             return null;
          }
-        // 4.不存在，根据id查询数据库
-        Shop shop = getById( id);
-        // 5.数据库不存在，返回错误
-        if(shop==null){
+         // 4.不存在，根据id查询数据库
+         Shop shop = getById( id);
+         // 5.数据库不存在，返回错误
+         if(shop==null){
             /*  内容：将空值写入Redis
                 时间： 2025/9/24 00:20 */
-             stringRedisTemplate.opsForValue().set(Key,"",CACHE_NULL_TTL,TimeUnit.MINUTES);
-            return Result.fail("店铺不存在");
-        }
-        //6.存在，写入redis
-        //设置redis缓存时添加过期时间
-        stringRedisTemplate.opsForValue().set(Key,JSONUtil.toJsonStr(shop),CACHE_SHOP_TTL, TimeUnit.MINUTES);
-        return Result.ok(shop);
+             // 为防止缓存雪崩，给空值也添加随机过期时间
+             Random random = new Random();
+             Long randomTTL = CACHE_NULL_TTL + random.nextInt(5);
+             stringRedisTemplate.opsForValue().set(Key,"",randomTTL,TimeUnit.MINUTES);
+             return null;
+         }
+         //6.存在，写入redis
+         //设置redis缓存时添加过期时间，增加随机值防止缓存雪崩
+         Random random = new Random();
+         Long randomTTL = CACHE_SHOP_TTL + random.nextInt(10);
+         stringRedisTemplate.opsForValue().set(Key,JSONUtil.toJsonStr(shop),randomTTL, TimeUnit.MINUTES);
+         return shop;
     }
 
     @Override
